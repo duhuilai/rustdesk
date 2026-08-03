@@ -1,13 +1,9 @@
 name: Fdroid version file generation
 
 on:
+  # 自建仓库：已停用自动触发以节省 CI 配额，仅保留手动触发。
+  # 由 custom/apply_custom.py 自动维护，请勿手改。
   workflow_dispatch:
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-      - '[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+-[0-9]+'
-      - '[0-9]+.[0-9]+.[0-9]+-[0-9]+'
 
 jobs:
   # https://gitlab.com/fdroid/fdroiddata/-/blob/master/metadata/com.carriez.flutter_hbb.yml
