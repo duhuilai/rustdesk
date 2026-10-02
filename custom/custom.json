@@ -1,0 +1,27 @@
+{
+  "rendezvous_servers": [
+    "222.128.49.178"
+  ],
+  "rs_pub_key": "LQT7jYJlwj5FTwZH3xNC4enXmRbjRjNOhb4RMg8Zljw=",
+  "update_repo": "duhuilai/rustdesk",
+  "upstream_repo": "rustdesk/rustdesk",
+  "upstream_hbb_common_repo": "rustdesk/hbb_common",
+  "disable_workflows": [
+    "ci.yml",
+    "fdroid.yml",
+    "flutter-nightly.yml"
+  ],
+  "disable_build_jobs": [
+    "build-for-windows-sciter",
+    "build-rustdesk-ios",
+    "build-for-macOS",
+    "publish_unsigned",
+    "build-rustdesk-android",
+    "build-rustdesk-android-universal",
+    "build-rustdesk-linux",
+    "build-rustdesk-linux-sciter",
+    "build-appimage",
+    "build-flatpak",
+    "build-rustdesk-web"
+  ]
+}
