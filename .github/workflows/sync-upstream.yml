@@ -1,0 +1,211 @@
+name: 同步上游并发布
+
+# 工作原理
+# --------
+# 1. 定时（或手动）查询上游 rustdesk/rustdesk 的最新正式版 Release。
+# 2. 若本仓库尚无同名标签，则把上游该版本合并进 master。
+# 3. 重新内联上游锁定版本的 hbb_common，并执行 custom/apply_custom.py
+#    把自建 ID 服务器 / 公钥 / 更新源重新写回源码。
+# 4. 推送 master，并打上同名标签。
+#
+# 标签推送会触发上游自带的 .github/workflows/flutter-tag.yml，
+# 由它调用 flutter-build.yml 完成全平台构建并发布安装包。
+#
+# 重要：必须配置 RELEASE_PAT 这个仓库 Secret（一个具备 repo + workflow 权限的
+# Personal Access Token）。GitHub 有防递归机制——用默认的 GITHUB_TOKEN 推送标签
+# 不会触发任何工作流，构建链路会断在这里。
+
+on:
+  schedule:
+    # 每 6 小时检查一次上游发布
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "上游版本号（留空则自动取最新正式版，例如 1.4.9）"
+        required: false
+        type: string
+      force_rebuild:
+        description: "即使已存在同名标签也强制重新同步并重新打标签"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: rustdesk/rustdesk
+  HBB_REPO: rustdesk/hbb_common
+
+jobs:
+  sync:
+    name: 同步上游并打标签
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检查 RELEASE_PAT 配置
+        env:
+          PAT: ${{ secrets.RELEASE_PAT }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "::warning::未配置 RELEASE_PAT，标签推送将无法触发构建工作流（GitHub 防递归限制）。同步仍会执行，但需要手动运行 Flutter Tag Build。"
+          else
+            echo "RELEASE_PAT 已配置。"
+          fi
+
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT || github.token }}
+
+      - name: 解析上游目标版本
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+          FORCE: ${{ inputs.force_rebuild }}
+        run: |
+          set -euo pipefail
+
+          TAG="${INPUT_TAG:-}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)
+          fi
+          echo "上游目标版本: $TAG"
+
+          if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$'; then
+            echo "::error::版本号 '$TAG' 不符合 flutter-tag.yml 的标签模式，构建不会被触发。"
+            exit 1
+          fi
+
+          SKIP=false
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            if [ "${FORCE}" = "true" ]; then
+              echo "本仓库已存在标签 ${TAG}，但已指定强制重建。"
+            else
+              echo "本仓库已存在标签 ${TAG}，无需同步。"
+              SKIP=true
+            fi
+          fi
+
+          echo "tag=${TAG}"   >> "$GITHUB_OUTPUT"
+          echo "skip=${SKIP}" >> "$GITHUB_OUTPUT"
+
+      - name: 同步上游代码（重置到发布提交）
+        if: steps.resolve.outputs.skip == 'false'
+        id: merge
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch --no-tags upstream "refs/tags/${TAG}:refs/remotes/upstream/tag-${TAG}"
+          UPSTREAM_SHA=$(git rev-parse "refs/remotes/upstream/tag-${TAG}")
+          echo "上游提交: ${UPSTREAM_SHA}"
+
+          # 读取上游在该版本锁定的 hbb_common 子模块提交
+          HBB_SHA=$(git ls-tree "${UPSTREAM_SHA}" libs/hbb_common | awk '{print $3}')
+          if [ -z "${HBB_SHA}" ]; then
+            echo "::error::无法从上游 ${TAG} 读取 libs/hbb_common 的锁定提交。"
+            exit 1
+          fi
+          echo "hbb_common 锁定提交: ${HBB_SHA}"
+
+          # 先把本仓库自有的定制文件备份出来——它们不在上游仓库中，
+          # 下面的 reset 会把它们清掉，需要在重置后恢复。
+          rm -rf /tmp/custom_bak /tmp/sync_upstream_bak.yml
+          cp -r custom /tmp/custom_bak
+          cp .github/workflows/sync-upstream.yml /tmp/sync_upstream_bak.yml
+
+          # 关键修正：直接把整个工作区重置到上游发布提交，而不是 merge。
+          # 原因：本仓库 master 基于某次克隆（可能领先于该发布），merge 祖先提交
+          # 是空操作，会保留与「锁定版 hbb_common」不一致的旧源码，导致编译失败
+          #（例如 OPTION_ID_WHITELIST 已在 hbb_common 中改名为 OPTION_WHITELIST）。
+          # 重置后 rustdesk 源码与锁定的 hbb_common 一定同源，保证可编译；
+          # 随后再用备份恢复本仓库自有文件，并由 apply_custom.py 重新写回定制。
+          git reset --hard "${UPSTREAM_SHA}"
+
+          # 恢复本仓库自有文件
+          rm -rf custom
+          cp -r /tmp/custom_bak custom
+          cp /tmp/sync_upstream_bak.yml .github/workflows/sync-upstream.yml
+
+          # 把 hbb_common 由子模块改为内联目录
+          git rm -r --cached --ignore-unmatch -q libs/hbb_common || true
+          git rm    --cached --ignore-unmatch -q .gitmodules     || true
+          rm -rf libs/hbb_common .gitmodules
+
+          git clone -q "https://github.com/${HBB_REPO}.git" /tmp/hbb_common
+          git -C /tmp/hbb_common checkout -q "${HBB_SHA}"
+          rm -rf /tmp/hbb_common/.git
+          mkdir -p libs
+          cp -r /tmp/hbb_common libs/hbb_common
+
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "hbb_sha=${HBB_SHA}"           >> "$GITHUB_OUTPUT"
+
+      - name: 重新应用自建定制
+        if: steps.resolve.outputs.skip == 'false'
+        run: python3 custom/apply_custom.py
+
+      - name: 提交并推送
+        if: steps.resolve.outputs.skip == 'false'
+        id: commit
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+
+          git add -A
+          if [ -f .git/MERGE_HEAD ] || ! git diff --cached --quiet HEAD; then
+            git commit -m "sync: 同步上游 ${TAG}" \
+                       -m "上游提交: ${UPSTREAM_SHA}" \
+                       -m "已重新应用 custom/apply_custom.py 中的自建配置。"
+            # 强制推送是有意为之：本仓库的 master 始终建模为「上游发布提交 + 自建定制」，
+            # 每次同步都会 git reset --hard 到新的发布提交，新提交的父链与旧 master 分叉，
+            # 因此必须 --force。旧的同步提交会变为悬空提交，可在需要时从对象库找回。
+            git push --force origin HEAD:master
+            echo "已强制推送 master（建模为 上游发布 + 自建定制）。"
+          else
+            echo "master 无变化，跳过提交。"
+          fi
+
+      - name: 打标签触发构建
+        if: steps.resolve.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git tag -f -a "${TAG}" -m "RustDesk ${TAG}（自建定制版）"
+          git push -f origin "refs/tags/${TAG}"
+          echo "已推送标签 ${TAG}，将触发 Flutter Tag Build 进行全平台构建。"
+
+      - name: 输出结果摘要
+        if: always()
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          SKIP: ${{ steps.resolve.outputs.skip }}
+        run: |
+          {
+            echo "## 上游同步结果"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 上游版本 | \`${TAG:-未解析}\` |"
+            if [ "${SKIP}" = "true" ]; then
+              echo "| 状态 | 已是最新，未做改动 |"
+            else
+              echo "| 状态 | 已同步并推送标签 |"
+              echo "| 后续 | Flutter Tag Build 正在构建全平台安装包 |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

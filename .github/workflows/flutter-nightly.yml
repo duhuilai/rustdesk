@@ -1,9 +1,8 @@
 name: Flutter Nightly Build
 
 on:
-  schedule:
-    # schedule build every night
-    - cron: "0 0 * * *"
+  # 自建仓库：已停用自动触发以节省 CI 配额，仅保留手动触发。
+  # 由 custom/apply_custom.py 自动维护，请勿手改。
   workflow_dispatch:
 
 jobs:
